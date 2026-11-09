@@ -153,6 +153,23 @@ docs/         DECISION-002 (retrieval), DECISION-003 (reranker, n=19), DECISION-
 tests/        extraction regression suite (pytest)
 ```
 
+## Chunkless variant
+
+This repo now also contains a **chunkless** RAG path that navigates document
+structure (sections/pages) instead of fixed-size chunks:
+
+```bash
+# ingest as sections
+chunkless-rag ingest data/raw/*.pdf --chunkless --index-dir ~/.chunkless/index
+# ask (reasoning navigator over the section outline)
+chunkless-rag ask "What is the return window?" --chunkless --index-dir ~/.chunkless/index
+# BM25-only, no LLM navigator
+chunkless-rag ask "..." --chunkless --no-navigator --index-dir ~/.chunkless/index
+```
+
+See `WORK_PLAN.md` for the full adaptation plan and `papers/` for the grounding
+literature (DeepRead, Adaptive Query Routing, Lost in the Middle).
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE). The challenge requires open source. Note that model

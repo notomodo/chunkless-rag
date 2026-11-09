@@ -68,7 +68,8 @@ def _print_index_stats(summary: IngestSummary) -> None:
 
 
 def _cmd_ingest(args: argparse.Namespace) -> int:
-    pipe = Pipeline(index_dir=args.index_dir, budget=args.budget)
+    pipe = Pipeline(index_dir=args.index_dir, budget=args.budget,
+                    chunkless=getattr(args, "chunkless", False))
     banner_shown = {"done": False}
 
     def on_event(ev: tuple) -> None:
@@ -113,7 +114,10 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
 
 
 def _cmd_ask(args: argparse.Namespace) -> int:
-    pipe = Pipeline(index_dir=args.index_dir, model=args.model, host=args.host)
+    pipe = Pipeline(index_dir=args.index_dir, model=args.model, host=args.host,
+                    chunkless=getattr(args, "chunkless", False),
+                    selector=getattr(args, "selector", "batch"),
+                    use_navigator=not getattr(args, "no_navigator", False))
 
     # Phase banner before the first token: at 65–105 s/question a silent CLI is
     # indistinguishable from a hang.
@@ -230,6 +234,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="extract, chunk, embed and persist PDFs")
     ing.add_argument("paths", nargs="+", help="PDF files and/or directories (recursed for *.pdf)")
     ing.add_argument("--budget", type=int, default=400, help="token budget per chunk")
+    ing.add_argument("--chunkless", action="store_true",
+                     help="ingest as sections (chunkless mode) instead of fixed-size chunks")
     ing.set_defaults(func=_cmd_ingest)
 
     ask = sub.add_parser("ask", parents=[common],
@@ -240,6 +246,12 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--host", default="http://localhost:11434", help="Ollama host")
     ask.add_argument("--verbose", action="store_true",
                      help="dump chunk ids, ranks, rrf scores and retrieval timings")
+    ask.add_argument("--chunkless", action="store_true",
+                     help="use chunkless (section) index + reasoning navigator")
+    ask.add_argument("--selector", choices=["batch", "tree"], default="batch",
+                     help="navigator strategy")
+    ask.add_argument("--no-navigator", action="store_true",
+                     help="disable LLM navigator; use BM25 only")
     ask.set_defaults(func=_cmd_ask)
     return p
 

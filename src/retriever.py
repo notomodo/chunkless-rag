@@ -316,7 +316,11 @@ class OnnxEncoder:
 
     def encode(self, texts: Sequence[str], is_query: bool = False) -> np.ndarray:
         prefix = self.q_prefix if is_query else self.p_prefix
-        encs = self.tok.encode_batch([prefix + t for t in texts])
+        # Truncate very long inputs to a safe token budget so a single long
+        # section cannot overflow the model's context window. Char-based
+        # truncation is a conservative proxy; the tokenizer re-tokenises below.
+        safe = [ (t[:1500] if not is_query else t[:512]) for t in texts ]
+        encs = self.tok.encode_batch([prefix + t for t in safe])
         maxlen = max(len(e.ids) for e in encs)
 
         ids = np.zeros((len(encs), maxlen), dtype=np.int64)

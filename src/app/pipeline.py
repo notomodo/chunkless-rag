@@ -171,6 +171,9 @@ class Pipeline:
         model: str = DEFAULT_OLLAMA_MODEL,
         host: str = DEFAULT_OLLAMA_HOST,
         think: bool | None = None,
+        chunkless: bool = False,
+        selector: str = "batch",
+        use_navigator: bool = True,
     ) -> None:
         self.index_dir = Path(index_dir).expanduser() if index_dir is not None else None
         self.onnx_path = Path(onnx_path) if onnx_path is not None else DEFAULT_ONNX_PATH
@@ -178,6 +181,9 @@ class Pipeline:
         self.budget = budget
         self.model = model
         self.host = host
+        self.chunkless = chunkless
+        self.selector = selector
+        self.use_navigator = use_navigator
         # Thinking-mode control for hybrid models (Qwen3): None => omit the field
         # entirely, so the payload is byte-identical to what the non-thinking
         # Qwen2.5 models were benchmarked with. Set False to disable a hybrid
@@ -294,13 +300,110 @@ class Pipeline:
         return out
 
     def _extract(self, pdf: Path) -> ExtractedDoc:
-        """Build an ExtractedDoc via the committed migration bridge. Char offsets
-        are reconstructed by locating each chunk body in the per-document line
-        stream; the bridge RAISES on any body it can't locate, so offsets are
-        faithful or ingestion aborts — never a silently-wrong or zero span."""
-        import migrate_chunk_ids  # scripts/: reuse _extract_doc, do not reinvent
+        if not self.chunkless:
+            import migrate_chunk_ids  # scripts/: reuse _extract_doc, do not reinvent
 
-        return migrate_chunk_ids._extract_doc(pdf, self.budget, self._get_tokenizer())
+            return migrate_chunk_ids._extract_doc(pdf, self.budget, self._get_tokenizer())
+
+        # Chunkless path: structure extraction -> sections as retrieval units.
+        import hashlib
+        import json
+        import sys
+        from pathlib import Path as _Path
+
+        _src = _Path(__file__).resolve().parents[1]
+        _root = _src.parent
+        for _p in (str(_src), str(_root / "scripts")):
+            if _p not in sys.path:
+                sys.path.insert(0, _p)
+
+        import structure  # noqa: E402
+        import summarise  # noqa: E402
+
+        tree = structure.build_tree(pdf)
+        structure.assign_ids(tree)
+        tok = self._get_tokenizer()
+        # summaries (extractive by default; LLM optional via env not wired here)
+        metas = structure.section_metadata(tree)
+        full_texts = [s.text for s in tree.sections]
+        summaries = summarise.summarise_sections(metas, full_texts, use_llm=False)
+        for m, s, sec in zip(metas, summaries, tree.sections):
+            m["summary"] = s
+            sec.summary = s
+
+        # sidecar: persist section metadata (heading, page range, summary) per doc
+        self._write_sections_meta(tree.sha256, metas)
+
+        return structure.to_extracted_doc(tree, self.budget, tok)
+
+    def _write_sections_meta(self, doc_sha: str, metas: list) -> None:
+        if self.index_dir is None:
+            return
+        p = Path(self.index_dir).expanduser() / "sections_meta.json"
+        data = {}
+        if p.exists():
+            try:
+                data = json.loads(p.read_text())
+            except Exception:
+                data = {}
+        data[doc_sha] = metas
+        p.write_text(json.dumps(data, indent=2))
+
+    def _load_sections_meta(self) -> dict:
+        if self.index_dir is None:
+            return {}
+        p = Path(self.index_dir).expanduser() / "sections_meta.json"
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return {}
+
+    def _chunkless_navigate(self, idx, question: str, k: int):
+        import sys
+        from pathlib import Path as _Path
+        _src = _Path(__file__).resolve().parents[1]
+        if str(_src) not in sys.path:
+            sys.path.insert(0, str(_src))
+        import navigator as _nav  # noqa: E402
+        from core.index import Hit, SearchResult  # noqa: E402
+
+        records = idx._read_all_chunks()
+        metas_all = self._load_sections_meta()
+        # map full sha by prefix from manifest
+        sha_by_prefix = {s[:8]: s for s in idx.manifest.get("documents", {}).keys()}
+
+        outline = []
+        for i, r in enumerate(records):
+            full_sha = sha_by_prefix.get(r["doc_sha256"][:8], r["doc_sha256"])
+            doc_metas = metas_all.get(full_sha, [])
+            ordinal = int(r["id"].split(":")[1]) if ":" in r["id"] else i
+            m = doc_metas[ordinal] if ordinal < len(doc_metas) else {}
+            outline.append({
+                "idx": i,
+                "heading": m.get("heading") or r["text"].split("\n", 1)[0][:80],
+                "pages": f"{r['page']}-{m.get('page_end', r['page'])}",
+                "summary": m.get("summary") or r["text"][:200],
+            })
+
+        chosen = _nav.navigate(outline, question, strategy=self.selector, k=k,
+                               model=self.model, host=self.host)
+        if not chosen:
+            return None
+        recs = [records[i] for i in chosen if 0 <= i < len(records)]
+        if not recs:
+            return None
+        hits = []
+        for r in recs:
+            hits.append(Hit(
+                id=r["id"], text=r["text"], filename=r["filename"], page=r["page"],
+                char_start=r["char_start"], char_end=r["char_end"],
+                rrf_score=0.0, bm25_rank=None, dense_rank=None,
+            ))
+        return SearchResult(hits=hits, considered=[], timings={
+            "bm25_ms": 0.0, "dense_ms": 0.0, "fuse_ms": 0.0, "total_ms": 0.0,
+        })
 
     @staticmethod
     def _collect_pdfs(paths: Sequence[str | Path]) -> list[Path]:
@@ -348,7 +451,14 @@ class Pipeline:
         if on_phase:
             on_phase("retrieving")
         t0 = time.perf_counter()
-        sr = idx.search(question, k=k, encoder=encoder)
+        sr = None
+        if self.chunkless and self.use_navigator:
+            try:
+                sr = self._chunkless_navigate(idx, question, k)
+            except Exception:
+                sr = None
+        if sr is None:
+            sr = idx.search(question, k=k, encoder=encoder)
         retrieval_s = time.perf_counter() - t0
 
         if on_phase:
